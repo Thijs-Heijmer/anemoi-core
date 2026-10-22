@@ -811,3 +811,193 @@ class SpectralCRPSLoss(SpectralLoss, CRPS):
     @property
     def name(self) -> str:
         return "CRPS-Spectral"
+
+class SpectralCVLoss(SpectralLoss):
+    """ Plan
+    Prediction and target fields
+  > obtain complete spatial grids
+  > select rectangular MEPS region
+  > subtract each field's spatial mean and apply Hann window
+  > FFT → power
+  > mean power in each radial/angular bin
+  > CV across populated angular bins within each radial band
+  > absolute prediction-target CV difference
+  > apply weights and reduce
+    """
+    hann_window: torch.Tensor
+    selected: torch.Tensor
+    bin_id: torch.Tensor
+    bin_counts: torch.Tensor
+
+    def __init__(
+        self,
+        transform: Literal[
+            "fft2d",
+            "dct2d",
+            "reduced_sht",
+            "octahedral_sht",
+        ] = "fft2d",
+        *,
+        x_dim: int,
+        y_dim: int,
+        min_freq: float,
+        max_freq: float,
+        radial_edge_count: int = 31,
+        annular_edge_count: int = 10,
+        apply_hann_window: bool = True,
+        axis_margin: float = 0,
+        no_autocast: bool = True,
+        ignore_nans: bool = False,
+        scalers: list | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            transform=transform,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            ignore_nans=ignore_nans,
+            scalers=scalers,
+            **kwargs,
+        )
+
+        # Calculate windows etc based on supplied grid
+        radial_edges = torch.logspace(min_freq, max_freq, radial_edge_count)  # frequency bins, [cycles/gridcell]
+        angle_edges = torch.arange(0, 181, annular_edge_count) # annular bins, degrees
+        
+        kx = torch.fft.fftshift(torch.fft.fftfreq(x_dim))
+        ky = torch.fft.fftshift(torch.fft.fftfreq(y_dim))
+        kr = torch.sqrt(kx[None, :]**2 + ky[:, None]**2)
+        angles = torch.rad2deg(torch.arctan2(ky[:, None], kx[None, :]))
+        hann_window = torch.hann_window(y_dim)[:, None] * torch.hann_window(x_dim)[None, :]
+        hann_window = einops.rearrange(hann_window, "y x -> (y x)", y=y_dim, x=x_dim)
+        radial_centres = torch.sqrt(radial_edges[:-1] * radial_edges[1:])
+        angle_centres = (angle_edges[:-1] + angle_edges[1:]) / 2
+        n_radial = len(radial_centres)
+        n_angles = len(angle_centres)
+
+        selected = (kr >= radial_edges[0]) & (kr < radial_edges[-1])
+        selected &= (
+            (angles >= axis_margin)
+            & (angles < 180 - axis_margin)
+            & (torch.abs(angles - 90) >= axis_margin)
+        )
+
+        radial_bins = torch.bucketize(kr, radial_edges, right=True) - 1
+        angular_bins = torch.bucketize(angles, angle_edges, right=True) - 1
+        bin_id = radial_bins * n_angles + angular_bins
+        bin_counts = torch.bincount(bin_id[selected], minlength=n_radial*n_angles)
+        print("")
+
+        # Register variables and buffers
+        # self.register_buffer("radial_bins", radial_bins)
+        # self.register_buffer("angular_bins", angular_bins)
+        self.no_autocast = no_autocast
+        self.apply_hann_window = apply_hann_window
+        self.n_radial = n_radial
+        self.n_angles = n_angles
+        self.register_buffer("hann_window", hann_window, persistent=False)
+        self.register_buffer("selected", selected, persistent=False)
+        self.register_buffer("bin_id", bin_id, persistent=False)
+        self.register_buffer("bin_counts", bin_counts, persistent=False)
+        
+
+    # Called in forward later
+    def _angular_cv(self, values: torch.Tensor):
+            """
+            Calculate mean CV (mean of frequency bins as well) using differentiable PyTorch operations.
+
+            The window to operate on can be calculated once and reused. Possibly do this during init? 
+
+            Use something like "self.register_buffer("window", window, persistent=False)" to make sure information is stored and moved around properly.
+
+            Input: spectral field of shape [b, t, e, v, y, x]
+            """
+            # TODO: Check if these are necessary, inputs might be verified long before getting to the loss function
+            # if self.apply_hann_window and values.shape != self.hann_window.shape:
+            #     raise ValueError(f"Expected a (y, x) field of shape {self.hann_window.shape}, got {values.shape}")
+            # if not torch.isfinite(values).all():
+            #         raise ValueError("FFT input contains nonfinite or missing values")
+            # if values.max() == values.min():
+            #     print("WARNING: FFT input is constant, " \
+            #     "this can produce a non-existent signal after a Hann window is applied.")
+            
+            # -> [b, t, e, v, k]
+            cv = values.real.new_full((*values.shape[:4], self.n_radial), float('nan'))
+            
+            
+            power = torch.abs(values)**2
+            #TODO: Other function, bincount does not work with the batched data, use scatter_add_
+            bin_sums = torch.bincount(self.bin_id[self.selected], weights=power[..., self.selected], minlength=self.n_radial * self.n_angles)
+            condition = self.bin_counts != 0
+            bin_means = torch.where(condition[None, :], torch.div(bin_sums, self.bin_counts, 
+                                                         out=bin_sums.new_full(bin_sums.shape, float('nan'))), self.bin_counts)
+            bin_means = torch.reshape(bin_means, (self.n_radial, self.n_angles))
+            n_valid = torch.isfinite(bin_means).sum(dim=1)
+
+            radial_mean = torch.nanmean(bin_means, dim=1)
+            valid = (n_valid >= 2) & (radial_mean > 0)
+            # Check if this will never contain nans!
+            cv[valid] = torch.std(bin_means[valid], dim=1) / radial_mean[valid]
+            # TODO: Check if this will work with the dimensions provided
+            return cv
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        squash: bool = True,
+        *,
+        scaler_indices: tuple[int, ...] | None = None,
+        without_scalers: list[str] | list[int] | None = None,
+        grid_shard_slice: slice | None = None,
+        group: ProcessGroup | None = None,
+        grid_shard_sizes: ShardSizes = None,
+        grid_dim: int | None = None,
+        squash_mode: Squash_mode = "avg",
+        ) -> torch.Tensor:
+
+        grid_dim = TensorDim.GRID if grid_dim is None else grid_dim
+        pred, target, channel_shard_sizes = self._prepare_for_spectral_transform(
+            pred,
+            target,
+            group,
+            grid_shard_slice,
+            grid_shard_sizes,
+            grid_dim,
+        )
+        is_sharded = channel_shard_sizes is not None
+        group = group if is_sharded else None
+
+        context = torch.amp.autocast(device_type=pred.device.type, enabled=False) if self.no_autocast else nullcontext()
+        with context:
+            
+            # Apply hann window to preds and targets
+            
+            # -> [..., modes, vars]
+            # _to_spectral adds two spatial dimensions to Tensor
+            # -> [..., y, x, vars]
+
+            # Apply Hann window:
+            if self.apply_hann_window:
+                # TODO: Reshape the hann_window
+                pred = (pred - pred.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
+                target = (target - target.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
+                # values = (values - values.mean()) * self.hann_window
+
+            pred_spec = self._to_spectral(pred)
+            pred_spec = torch.fft.fftshift(pred_spec, dim=(-3, -2))
+            
+            tgt_spec = self._to_spectral(target)
+            tgt_spec = torch.fft.fftshift(tgt_spec, dim=(-3, -2))
+
+            pred_spec = einops.rearrange(pred_spec, "b t e y x v -> b t e v y x")  # ensemble dim last for preds
+            tgt_spec = einops.rearrange(tgt_spec, "b t 1 y x v -> b t 1 v y x")
+
+            # Apply angular cv
+            pred_cv = self._angular_cv(pred_spec)
+            tgt_cv = self._angular_cv(tgt_spec)
+
+            # Calculate and return cv loss
+            
+        
+        pass
