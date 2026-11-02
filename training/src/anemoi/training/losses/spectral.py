@@ -935,11 +935,8 @@ class SpectralCVLoss(SpectralLoss):
             # -> [b, t, e, v, k]
             cv = values.real.new_full((*values.shape[:4], self.n_radial), float('nan'))
             
-            # -> 0 nans
             power = torch.abs(values)**2
-            #TODO: Other function, bincount does not work with the batched data, use scatter_add_
-            # bin_sums = torch.bincount(self.bin_id[self.selected], weights=power[..., self.selected], minlength=self.n_radial * self.n_angles)
-            
+    
             # Selects needed values. Gathers x, y dimensions into one vector.
             # Gathering is consistent for ids and power so this doesn't matter.
             ids = self.bin_id[self.selected]
@@ -948,19 +945,12 @@ class SpectralCVLoss(SpectralLoss):
             # Create initial array of zeros with the correct shape to scatter add.
             initial = power.new_zeros((*power.shape[:-1], self.n_angles * self.n_radial))
 
-            # -> 0 nans
             bin_sums = initial.scatter_add(dim=-1, index=ids.expand_as(power), src=power)
             
-            condition = self.bin_counts != 0
-
-            # Masking does not work with back propagation
-            # bin_means = torch.where(condition[None, :], torch.div(bin_sums, self.bin_counts)
-            #                         , self.bin_counts)
             bin_means = bin_sums / self.bin_counts.clamp_min(1)
             
             bin_means = torch.reshape(bin_means, (*bin_means.shape[:-1], self.n_radial, self.n_angles))
 
-            # TODO: Check and use this code, should be safer.
             populated = (
                 self.bin_counts.reshape(self.n_radial, self.n_angles) > 0
             )                                                     # [n_radial, n_angles]
@@ -976,7 +966,7 @@ class SpectralCVLoss(SpectralLoss):
             deviations = bin_means - radial_mean.unsqueeze(-1)
             deviations = deviations.masked_fill(~populated, 0)
 
-            # Sample standard deviation: sqrt(sum(deviation²) / (N - 1)).
+            # Sample standard deviation: sqrt(sum(deviation^2) / (N - 1)).
             # Use a vector norm instead of explicitly taking sqrt of summed squares. It has safe backward behaviour at deviation=0.
             radial_std = (
                 torch.linalg.vector_norm(deviations, dim=-1)
@@ -984,15 +974,6 @@ class SpectralCVLoss(SpectralLoss):
             )          
             valid = usable & (radial_mean > 0)
             cv[valid] = radial_std[valid] / radial_mean[valid]
-
-
-            # n_valid = torch.isfinite(bin_means).sum(dim=-1)
-            # radial_mean = torch.nanmean(bin_means, dim=-1)
-            # valid = (n_valid >= 2) & (radial_mean > 0)
-            
-            # # Check if this will never contain nans > Valid makes sure it doesnt
-            # cv[valid] = torch.std(bin_means[valid], dim=1) / radial_mean[valid]
-            # cv[valid] = torch.std(bin_means[valid], dim=1)
 
             # TODO: Trace why the CVloss_debug has cases where the radial_mean is 0.
             return cv
@@ -1035,10 +1016,8 @@ class SpectralCVLoss(SpectralLoss):
 
             # Apply Hann window:
             if self.apply_hann_window:
-                # TODO: Reshape the hann_window
                 pred = (pred - pred.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
                 target = (target - target.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
-                # values = (values - values.mean()) * self.hann_window
 
             pred_spec = self._to_spectral(pred)
             pred_spec = torch.fft.fftshift(pred_spec, dim=(-3, -2))
@@ -1062,8 +1041,7 @@ class SpectralCVLoss(SpectralLoss):
                 weighed_absolute_error = absolute_error
             
             # No scaling per variable, as CV is already mean normalised.
-            # self.reduce() will not work as that expects different dimensions
-            
+            # self.reduce() will not work as that expects different dimensions, so we reduce dimensions by hand.
             # Sum over time and cvs
             cv_time_summed = torch.nansum(weighed_absolute_error, dim=(TensorDim.TIME, 4), keepdim=True)
             # Mean over batch size, ensembles, and variables
