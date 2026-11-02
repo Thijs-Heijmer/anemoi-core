@@ -828,6 +828,7 @@ class SpectralCVLoss(SpectralLoss):
     selected: torch.Tensor
     bin_id: torch.Tensor
     bin_counts: torch.Tensor
+    bin_weights: torch.Tensor
 
     def __init__(
         self,
@@ -843,7 +844,8 @@ class SpectralCVLoss(SpectralLoss):
         min_freq: float,
         max_freq: float,
         radial_edge_count: int = 31,
-        annular_edge_count: int = 10,
+        angle_edge_count: int = 10,
+        bin_weights: torch.Tensor | None = None,
         apply_hann_window: bool = True,
         axis_margin: float = 0,
         no_autocast: bool = True,
@@ -860,9 +862,17 @@ class SpectralCVLoss(SpectralLoss):
             **kwargs,
         )
 
+        # Check if supplied bin weights have the correct shape
+        if bin_weights is not None:
+            if bin_weights.ndim != 1 or bin_weights.shape[0] != (radial_edge_count - 1):
+                raise ValueError(
+                    f"bin_weigths must have shape ({radial_edge_count},), "
+                    f"got {tuple(bin_weights.shape)}"
+                )
+
         # Calculate windows etc based on supplied grid
         radial_edges = torch.logspace(min_freq, max_freq, radial_edge_count)  # frequency bins, [cycles/gridcell]
-        angle_edges = torch.arange(0, 181, annular_edge_count) # annular bins, degrees
+        angle_edges = torch.arange(0, 181, angle_edge_count) # annular bins, degrees
         
         kx = torch.fft.fftshift(torch.fft.fftfreq(x_dim))
         ky = torch.fft.fftshift(torch.fft.fftfreq(y_dim))
@@ -886,15 +896,16 @@ class SpectralCVLoss(SpectralLoss):
         angular_bins = torch.bucketize(angles, angle_edges, right=True) - 1
         bin_id = radial_bins * n_angles + angular_bins
         bin_counts = torch.bincount(bin_id[selected], minlength=n_radial*n_angles)
-        print("")
 
         # Register variables and buffers
         # self.register_buffer("radial_bins", radial_bins)
         # self.register_buffer("angular_bins", angular_bins)
+        
         self.no_autocast = no_autocast
         self.apply_hann_window = apply_hann_window
         self.n_radial = n_radial
         self.n_angles = n_angles
+        self.register_buffer("bin_weights", bin_weights, persistent=False)
         self.register_buffer("hann_window", hann_window, persistent=False)
         self.register_buffer("selected", selected, persistent=False)
         self.register_buffer("bin_id", bin_id, persistent=False)
@@ -924,21 +935,66 @@ class SpectralCVLoss(SpectralLoss):
             # -> [b, t, e, v, k]
             cv = values.real.new_full((*values.shape[:4], self.n_radial), float('nan'))
             
-            
+            # -> 0 nans
             power = torch.abs(values)**2
             #TODO: Other function, bincount does not work with the batched data, use scatter_add_
-            bin_sums = torch.bincount(self.bin_id[self.selected], weights=power[..., self.selected], minlength=self.n_radial * self.n_angles)
-            condition = self.bin_counts != 0
-            bin_means = torch.where(condition[None, :], torch.div(bin_sums, self.bin_counts, 
-                                                         out=bin_sums.new_full(bin_sums.shape, float('nan'))), self.bin_counts)
-            bin_means = torch.reshape(bin_means, (self.n_radial, self.n_angles))
-            n_valid = torch.isfinite(bin_means).sum(dim=1)
+            # bin_sums = torch.bincount(self.bin_id[self.selected], weights=power[..., self.selected], minlength=self.n_radial * self.n_angles)
+            
+            # Selects needed values. Gathers x, y dimensions into one vector.
+            # Gathering is consistent for ids and power so this doesn't matter.
+            ids = self.bin_id[self.selected]
+            power = power[..., self.selected]
 
-            radial_mean = torch.nanmean(bin_means, dim=1)
-            valid = (n_valid >= 2) & (radial_mean > 0)
-            # Check if this will never contain nans!
-            cv[valid] = torch.std(bin_means[valid], dim=1) / radial_mean[valid]
-            # TODO: Check if this will work with the dimensions provided
+            # Create initial array of zeros with the correct shape to scatter add.
+            initial = power.new_zeros((*power.shape[:-1], self.n_angles * self.n_radial))
+
+            # -> 0 nans
+            bin_sums = initial.scatter_add(dim=-1, index=ids.expand_as(power), src=power)
+            
+            condition = self.bin_counts != 0
+
+            # Masking does not work with back propagation
+            # bin_means = torch.where(condition[None, :], torch.div(bin_sums, self.bin_counts)
+            #                         , self.bin_counts)
+            bin_means = bin_sums / self.bin_counts.clamp_min(1)
+            
+            bin_means = torch.reshape(bin_means, (*bin_means.shape[:-1], self.n_radial, self.n_angles))
+
+            # TODO: Check and use this code, should be safer.
+            populated = (
+                self.bin_counts.reshape(self.n_radial, self.n_angles) > 0
+            )                                                     # [n_radial, n_angles]
+            n_populated = populated.sum(dim=-1)                   # [n_radial]
+            usable = n_populated >= 2                             # [n_radial]
+
+            # Mean over populated angular bins only.
+            radial_mean = (
+                bin_means.masked_fill(~populated, 0).sum(dim=-1)
+                / n_populated.clamp_min(1)
+            )                                                     
+
+            deviations = bin_means - radial_mean.unsqueeze(-1)
+            deviations = deviations.masked_fill(~populated, 0)
+
+            # Sample standard deviation: sqrt(sum(deviation²) / (N - 1)).
+            # Use a vector norm instead of explicitly taking sqrt of summed squares. It has safe backward behaviour at deviation=0.
+            radial_std = (
+                torch.linalg.vector_norm(deviations, dim=-1)
+                / (n_populated - 1).clamp_min(1).sqrt()
+            )          
+            valid = usable & (radial_mean > 0)
+            cv[valid] = radial_std[valid] / radial_mean[valid]
+
+
+            # n_valid = torch.isfinite(bin_means).sum(dim=-1)
+            # radial_mean = torch.nanmean(bin_means, dim=-1)
+            # valid = (n_valid >= 2) & (radial_mean > 0)
+            
+            # # Check if this will never contain nans > Valid makes sure it doesnt
+            # cv[valid] = torch.std(bin_means[valid], dim=1) / radial_mean[valid]
+            # cv[valid] = torch.std(bin_means[valid], dim=1)
+
+            # TODO: Trace why the CVloss_debug has cases where the radial_mean is 0.
             return cv
 
     def forward(
@@ -990,14 +1046,29 @@ class SpectralCVLoss(SpectralLoss):
             tgt_spec = self._to_spectral(target)
             tgt_spec = torch.fft.fftshift(tgt_spec, dim=(-3, -2))
 
-            pred_spec = einops.rearrange(pred_spec, "b t e y x v -> b t e v y x")  # ensemble dim last for preds
+            pred_spec = einops.rearrange(pred_spec, "b t e y x v -> b t e v y x")  # grid dim last
             tgt_spec = einops.rearrange(tgt_spec, "b t 1 y x v -> b t 1 v y x")
 
-            # Apply angular cv
+            # Apply angular cv -> [b, t, e, v, cv]
             pred_cv = self._angular_cv(pred_spec)
             tgt_cv = self._angular_cv(tgt_spec)
 
             # Calculate and return cv loss
+            # MAE? MSE? Weighing per bin?
+            absolute_error = (pred_cv - tgt_cv).abs()
+            if self.bin_weights is not None:
+                weighed_absolute_error = absolute_error.mul(self.bin_weights)
+            else:
+                weighed_absolute_error = absolute_error
             
+            # No scaling per variable, as CV is already mean normalised.
+            # self.reduce() will not work as that expects different dimensions
+            
+            # Sum over time and cvs
+            cv_time_summed = torch.nansum(weighed_absolute_error, dim=(TensorDim.TIME, 4), keepdim=True)
+            # Mean over batch size, ensembles, and variables
+            out = torch.nanmean(cv_time_summed, dim=(TensorDim.BATCH_SIZE, TensorDim.ENSEMBLE_DIM, 3))
+            # Remove excess dimenions to reduce to a scalar
+            out = out.squeeze()
+            return out
         
-        pass
