@@ -813,16 +813,18 @@ class SpectralCRPSLoss(SpectralLoss, CRPS):
         return "CRPS-Spectral"
 
 class SpectralCVLoss(SpectralLoss):
-    """ Plan
-    Prediction and target fields
-  > obtain complete spatial grids
-  > select rectangular MEPS region
-  > subtract each field's spatial mean and apply Hann window
-  > FFT → power
-  > mean power in each radial/angular bin
-  > CV across populated angular bins within each radial band
-  > absolute prediction-target CV difference
-  > apply weights and reduce
+    """
+    ## Radial Coefficient of Variation Loss on the FFT field.
+    - Bin_weights are not normalised internally. Loss returns a weighed sum.
+    - Min and max frequencies should be 1/ny and 0.5 [cylces per gridcell]
+    - Angle_edge_count should be dividing 180.
+    
+    Known issues:
+    - It is possible to pass frequency arguments that lead to zero usable radial bands, this is not checked for.
+    - It is possible to pass an angular bin step that does not lead to a last bin at 180 degrees. 
+        This leads to an unhandled shape error.
+    - Scalers are not supported.
+    - FFT patching is not supported
     """
     hann_window: torch.Tensor
     selected: torch.Tensor
@@ -834,9 +836,6 @@ class SpectralCVLoss(SpectralLoss):
         self,
         transform: Literal[
             "fft2d",
-            "dct2d",
-            "reduced_sht",
-            "octahedral_sht",
         ] = "fft2d",
         *,
         x_dim: int,
@@ -864,14 +863,23 @@ class SpectralCVLoss(SpectralLoss):
 
         # Check if supplied bin weights have the correct shape
         if bin_weights is not None:
+            bin_weights = torch.as_tensor(bin_weights, dtype=torch.float32)
             if bin_weights.ndim != 1 or bin_weights.shape[0] != (radial_edge_count - 1):
                 raise ValueError(
                     f"bin_weigths must have shape ({radial_edge_count},), "
                     f"got {tuple(bin_weights.shape)}"
                 )
+            if bin_weights.is_complex():
+                raise ValueError("bin_weights must be real")
+
+            if not torch.isfinite(bin_weights).all():
+                raise ValueError("bin_weights must be finite")
+
+            if (bin_weights < 0).any():
+                raise ValueError("bin_weights must be nonnegative")
 
         # Calculate windows etc based on supplied grid
-        radial_edges = torch.logspace(min_freq, max_freq, radial_edge_count)  # frequency bins, [cycles/gridcell]
+        radial_edges = torch.logspace(torch.log10(torch.as_tensor(min_freq)), torch.log10(torch.as_tensor(max_freq)), radial_edge_count)  # frequency bins, [cycles/gridcell]
         angle_edges = torch.arange(0, 181, angle_edge_count) # annular bins, degrees
         
         kx = torch.fft.fftshift(torch.fft.fftfreq(x_dim))
@@ -913,7 +921,7 @@ class SpectralCVLoss(SpectralLoss):
         
 
     # Called in forward later
-    def _angular_cv(self, values: torch.Tensor):
+    def _angular_cv(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             """
             Calculate mean CV (mean of frequency bins as well) using differentiable PyTorch operations.
 
@@ -933,8 +941,9 @@ class SpectralCVLoss(SpectralLoss):
             #     "this can produce a non-existent signal after a Hann window is applied.")
             
             # -> [b, t, e, v, k]
+            self._require_finite("Spectral coefficients", values)
+
             cv = values.real.new_full((*values.shape[:4], self.n_radial), float('nan'))
-            
             power = torch.abs(values)**2
     
             # Selects needed values. Gathers x, y dimensions into one vector.
@@ -975,9 +984,13 @@ class SpectralCVLoss(SpectralLoss):
             valid = usable & (radial_mean > 0)
             cv[valid] = radial_std[valid] / radial_mean[valid]
 
-            # TODO: Trace why the CVloss_debug has cases where the radial_mean is 0.
-            return cv
-
+            return cv, valid
+    
+    @staticmethod
+    def _require_finite(name: str, values: torch.Tensor) -> None:
+        if not torch.isfinite(values).all():
+            raise ValueError(f"{name} contains NaN or Inf")
+        
     def forward(
         self,
         pred: torch.Tensor,
@@ -1008,45 +1021,66 @@ class SpectralCVLoss(SpectralLoss):
         context = torch.amp.autocast(device_type=pred.device.type, enabled=False) if self.no_autocast else nullcontext()
         with context:
             
-            # Apply hann window to preds and targets
-            
             # -> [..., modes, vars]
             # _to_spectral adds two spatial dimensions to Tensor
             # -> [..., y, x, vars]
+            # pred_spec = self._to_spectral(pred)
+            pred = self._select_and_project(pred)
+            target = self._select_and_project(target)
 
-            # Apply Hann window:
+            self._require_finite("Selected prediction", pred)
+            self._require_finite("Selected target", target)
+            
             if self.apply_hann_window:
                 pred = (pred - pred.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
                 target = (target - target.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
-
-            pred_spec = self._to_spectral(pred)
-            pred_spec = torch.fft.fftshift(pred_spec, dim=(-3, -2))
             
-            tgt_spec = self._to_spectral(target)
+            pred_spec = self.transform.forward(pred)
+            tgt_spec = self.transform.forward(target)
+
+            pred_spec = torch.fft.fftshift(pred_spec, dim=(-3, -2))
             tgt_spec = torch.fft.fftshift(tgt_spec, dim=(-3, -2))
 
             pred_spec = einops.rearrange(pred_spec, "b t e y x v -> b t e v y x")  # grid dim last
             tgt_spec = einops.rearrange(tgt_spec, "b t 1 y x v -> b t 1 v y x")
 
             # Apply angular cv -> [b, t, e, v, cv]
-            pred_cv = self._angular_cv(pred_spec)
-            tgt_cv = self._angular_cv(tgt_spec)
+            pred_cv, pred_valid = self._angular_cv(pred_spec)
+            tgt_cv, tgt_valid = self._angular_cv(tgt_spec)
+
+            valid_pair = pred_valid & tgt_valid
 
             # Calculate and return cv loss
-            # MAE? MSE? Weighing per bin?
+            # MAE, apply weighing per bin.
             absolute_error = (pred_cv - tgt_cv).abs()
+            absolute_error = absolute_error.masked_fill(~valid_pair, 0)
+
             if self.bin_weights is not None:
                 weighed_absolute_error = absolute_error.mul(self.bin_weights)
             else:
                 weighed_absolute_error = absolute_error
+
+            # Rearrange again consistent with tensordim to prepare for resharding
+            weighed_absolute_error = einops.rearrange(weighed_absolute_error, "b t e v r -> b t e r v")
+            weighed_absolute_error, spectral_shard_slice, global_spectral_size = self._reshard_spectral_loss(
+            weighed_absolute_error,
+            group,
+            channel_shard_sizes,
+            grid_dim,
+            )
+
+            _assert_spectral_scalers_compatible(self.scaler, global_spectral_size)
+            # Scaling allows per variable setting of importance, even though CV is already mean normalised.
+            # scaled = self.scale(
+            #     weighed_absolute_error,
+            #     scaler_indices,
+            #     without_scalers=without_scalers,
+            #     grid_shard_slice=spectral_shard_slice,
+            # )
             
-            # No scaling per variable, as CV is already mean normalised.
-            # self.reduce() will not work as that expects different dimensions, so we reduce dimensions by hand.
-            # Sum over time and cvs
-            cv_time_summed = torch.nansum(weighed_absolute_error, dim=(TensorDim.TIME, 4), keepdim=True)
-            # Mean over batch size, ensembles, and variables
-            out = torch.nanmean(cv_time_summed, dim=(TensorDim.BATCH_SIZE, TensorDim.ENSEMBLE_DIM, 3))
-            # Remove excess dimenions to reduce to a scalar
-            out = out.squeeze()
-            return out
-        
+            # Reduce, sharding compatible
+            return self.reduce(weighed_absolute_error, squash=squash, group=group, squash_mode=squash_mode)
+
+    @property
+    def name(self) -> str:
+        return "Spectral-CV"
