@@ -818,12 +818,17 @@ class SpectralCVLoss(SpectralLoss):
     - Bin_weights are not normalised internally. Loss returns a weighed sum.
     - Min and max frequencies should be 1/ny and 0.5 [cylces per gridcell]
     - Angle_edge_count should be dividing 180.
+    - Variable, time, and radial-band scalers are applied after computing CV errors.
+      Use SpectralDimensionScaler(n_spectral_modes=1, spectral_dims=radial_edge_count - 1)
+      for unit radial weights that preserve the weighted sum over bands.
+    - nan_mask_weights must have a singleton grid dimension (as in its default
+      all-ones state). Spatial NaN masks cannot be mapped to radial bands, and
+      the selected FFT inputs must remain finite.
     
     Known issues:
     - It is possible to pass frequency arguments that lead to zero usable radial bands, this is not checked for.
     - It is possible to pass an angular bin step that does not lead to a last bin at 180 degrees. 
         This leads to an unhandled shape error.
-    - Scalers are not supported.
     - FFT patching is not supported
     """
     hann_window: torch.Tensor
@@ -840,8 +845,8 @@ class SpectralCVLoss(SpectralLoss):
         *,
         x_dim: int,
         y_dim: int,
-        min_freq: float,
-        max_freq: float,
+        min_freq: float | None = None,
+        max_freq: float = 0.5,
         radial_edge_count: int = 31,
         angle_edge_count: int = 10,
         bin_weights: torch.Tensor | None = None,
@@ -860,6 +865,9 @@ class SpectralCVLoss(SpectralLoss):
             scalers=scalers,
             **kwargs,
         )
+        # If not given, calculate the minimum frequency based on frequency resolution
+        if min_freq is None:
+            min_freq = 1 / min(x_dim, y_dim)
 
         # Check if supplied bin weights have the correct shape
         if bin_weights is not None:
@@ -1063,23 +1071,33 @@ class SpectralCVLoss(SpectralLoss):
             # Rearrange again consistent with tensordim to prepare for resharding
             weighed_absolute_error = einops.rearrange(weighed_absolute_error, "b t e v r -> b t e r v")
             weighed_absolute_error, spectral_shard_slice, global_spectral_size = self._reshard_spectral_loss(
-            weighed_absolute_error,
-            group,
-            channel_shard_sizes,
-            grid_dim,
+                weighed_absolute_error,
+                group,
+                channel_shard_sizes,
+                grid_dim,
             )
 
+            nan_mask = self.scaler.tensors.get("nan_mask_weights")
+            if nan_mask is not None:
+                dims, weights = nan_mask
+                if TensorDim.GRID in dims and weights.shape[dims.index(TensorDim.GRID)] > 1:
+                    msg = (
+                        "SpectralCVLoss does not support spatial nan_mask_weights: "
+                        "the mask must have a singleton grid dimension. Spatial missing-value "
+                        "masks cannot be applied to radial bands; the selected FFT grid must be finite."
+                    )
+                    raise ValueError(msg)
             _assert_spectral_scalers_compatible(self.scaler, global_spectral_size)
             # Scaling allows per variable setting of importance, even though CV is already mean normalised.
-            # scaled = self.scale(
-            #     weighed_absolute_error,
-            #     scaler_indices,
-            #     without_scalers=without_scalers,
-            #     grid_shard_slice=spectral_shard_slice,
-            # )
-            
+            scaled = self.scale(
+                weighed_absolute_error,
+                scaler_indices,
+                without_scalers=without_scalers,
+                grid_shard_slice=spectral_shard_slice,
+            )
+
             # Reduce, sharding compatible
-            return self.reduce(weighed_absolute_error, squash=squash, group=group, squash_mode=squash_mode)
+            return self.reduce(scaled, squash=squash, group=group, squash_mode=squash_mode)
 
     @property
     def name(self) -> str:
