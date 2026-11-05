@@ -723,6 +723,44 @@ Then reference it from the loss:
             nlat: 192 # o96 grid
             scalers: ['pressure_level', 'general_variable', 'spectral_dim_mean']
 
+Radial CV loss scaling
+---------------------
+
+``SpectralCVLoss`` uses radial bands as its spectral dimension. To preserve
+its weighted **sum** over bands, configure unit radial weights using the
+existing ``SpectralDimensionScaler``:
+
+.. code:: yaml
+
+   # Under training.scalers.datasets.data:
+   cv_radial_weights:
+      _target_: anemoi.training.losses.scalers.SpectralDimensionScaler
+      n_spectral_modes: 1
+      spectral_dims: 30
+
+Set ``spectral_dims`` to ``radial_edge_count - 1`` (30 for the default
+31 edges). On the CV loss, select:
+
+.. code:: yaml
+
+   scalers:
+      - pressure_level
+      - general_variable
+      - nan_mask_weights
+      - cv_radial_weights
+      - time_steps
+
+The pressure, variable, and time scalers weight the computed CV errors.
+``bin_weights`` are applied once, without normalization, before these
+scalers. Keep any separate ``spectral_weights`` used by SpectralCRPS;
+its FFT-mode dimension is different from the CV radial-band dimension.
+
+The default all-ones ``nan_mask_weights`` is supported. An attached mask
+with more than one grid entry is rejected, even if its length matches
+the number of radial bands: spatial missing-value masks do not describe
+radial-band weights. The selected FFT inputs must be finite. This
+configuration does not add support for FFTs of fields with missing data.
+
 Custom Scalers
 ==============
 

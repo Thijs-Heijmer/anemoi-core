@@ -811,3 +811,294 @@ class SpectralCRPSLoss(SpectralLoss, CRPS):
     @property
     def name(self) -> str:
         return "CRPS-Spectral"
+
+class SpectralCVLoss(SpectralLoss):
+    """
+    ## Radial Coefficient of Variation Loss on the FFT field.
+    - Bin_weights are not normalised internally. Loss returns a weighed sum.
+    - Min and max frequencies should be 1/ny and 0.5 [cylces per gridcell]
+    - Angle_edge_count should be dividing 180.
+    - Variable, time, and radial-band scalers are applied after computing CV errors.
+      Use SpectralDimensionScaler(n_spectral_modes=1, spectral_dims=radial_edge_count - 1)
+      for unit radial weights that preserve the weighted sum over bands.
+    - nan_mask_weights must have a singleton grid dimension (as in its default
+      all-ones state). Spatial NaN masks cannot be mapped to radial bands, and
+      the selected FFT inputs must remain finite.
+    
+    Known issues:
+    - It is possible to pass frequency arguments that lead to zero usable radial bands, this is not checked for.
+    - It is possible to pass an angular bin step that does not lead to a last bin at 180 degrees. 
+        This leads to an unhandled shape error.
+    - FFT patching is not supported
+    """
+    hann_window: torch.Tensor
+    selected: torch.Tensor
+    bin_id: torch.Tensor
+    bin_counts: torch.Tensor
+    bin_weights: torch.Tensor
+
+    def __init__(
+        self,
+        transform: Literal[
+            "fft2d",
+        ] = "fft2d",
+        *,
+        x_dim: int,
+        y_dim: int,
+        min_freq: float | None = None,
+        max_freq: float = 0.5,
+        radial_edge_count: int = 31,
+        angle_edge_count: int = 10,
+        bin_weights: torch.Tensor | None = None,
+        apply_hann_window: bool = True,
+        axis_margin: float = 0,
+        no_autocast: bool = True,
+        ignore_nans: bool = False,
+        scalers: list | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            transform=transform,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            ignore_nans=ignore_nans,
+            scalers=scalers,
+            **kwargs,
+        )
+        # If not given, calculate the minimum frequency based on frequency resolution
+        if min_freq is None:
+            min_freq = 1 / min(x_dim, y_dim)
+
+        # Check if supplied bin weights have the correct shape
+        if bin_weights is not None:
+            bin_weights = torch.as_tensor(bin_weights, dtype=torch.float32)
+            if bin_weights.ndim != 1 or bin_weights.shape[0] != (radial_edge_count - 1):
+                raise ValueError(
+                    f"bin_weigths must have shape ({radial_edge_count},), "
+                    f"got {tuple(bin_weights.shape)}"
+                )
+            if bin_weights.is_complex():
+                raise ValueError("bin_weights must be real")
+
+            if not torch.isfinite(bin_weights).all():
+                raise ValueError("bin_weights must be finite")
+
+            if (bin_weights < 0).any():
+                raise ValueError("bin_weights must be nonnegative")
+
+        # Calculate windows etc based on supplied grid
+        radial_edges = torch.logspace(torch.log10(torch.as_tensor(min_freq)), torch.log10(torch.as_tensor(max_freq)), radial_edge_count)  # frequency bins, [cycles/gridcell]
+        angle_edges = torch.arange(0, 181, angle_edge_count) # annular bins, degrees
+        
+        kx = torch.fft.fftshift(torch.fft.fftfreq(x_dim))
+        ky = torch.fft.fftshift(torch.fft.fftfreq(y_dim))
+        kr = torch.sqrt(kx[None, :]**2 + ky[:, None]**2)
+        angles = torch.rad2deg(torch.arctan2(ky[:, None], kx[None, :]))
+        hann_window = torch.hann_window(y_dim)[:, None] * torch.hann_window(x_dim)[None, :]
+        hann_window = einops.rearrange(hann_window, "y x -> (y x)", y=y_dim, x=x_dim)
+        radial_centres = torch.sqrt(radial_edges[:-1] * radial_edges[1:])
+        angle_centres = (angle_edges[:-1] + angle_edges[1:]) / 2
+        n_radial = len(radial_centres)
+        n_angles = len(angle_centres)
+
+        selected = (kr >= radial_edges[0]) & (kr < radial_edges[-1])
+        selected &= (
+            (angles >= axis_margin)
+            & (angles < 180 - axis_margin)
+            & (torch.abs(angles - 90) >= axis_margin)
+        )
+
+        radial_bins = torch.bucketize(kr, radial_edges, right=True) - 1
+        angular_bins = torch.bucketize(angles, angle_edges, right=True) - 1
+        bin_id = radial_bins * n_angles + angular_bins
+        bin_counts = torch.bincount(bin_id[selected], minlength=n_radial*n_angles)
+
+        # Register variables and buffers
+        # self.register_buffer("radial_bins", radial_bins)
+        # self.register_buffer("angular_bins", angular_bins)
+        
+        self.no_autocast = no_autocast
+        self.apply_hann_window = apply_hann_window
+        self.n_radial = n_radial
+        self.n_angles = n_angles
+        self.register_buffer("bin_weights", bin_weights, persistent=False)
+        self.register_buffer("hann_window", hann_window, persistent=False)
+        self.register_buffer("selected", selected, persistent=False)
+        self.register_buffer("bin_id", bin_id, persistent=False)
+        self.register_buffer("bin_counts", bin_counts, persistent=False)
+        
+
+    # Called in forward later
+    def _angular_cv(self, values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            """
+            Calculate mean CV (mean of frequency bins as well) using differentiable PyTorch operations.
+
+            The window to operate on can be calculated once and reused. Possibly do this during init? 
+
+            Use something like "self.register_buffer("window", window, persistent=False)" to make sure information is stored and moved around properly.
+
+            Input: spectral field of shape [b, t, e, v, y, x]
+            """
+            # TODO: Check if these are necessary, inputs might be verified long before getting to the loss function
+            # if self.apply_hann_window and values.shape != self.hann_window.shape:
+            #     raise ValueError(f"Expected a (y, x) field of shape {self.hann_window.shape}, got {values.shape}")
+            # if not torch.isfinite(values).all():
+            #         raise ValueError("FFT input contains nonfinite or missing values")
+            # if values.max() == values.min():
+            #     print("WARNING: FFT input is constant, " \
+            #     "this can produce a non-existent signal after a Hann window is applied.")
+            
+            # -> [b, t, e, v, k]
+            self._require_finite("Spectral coefficients", values)
+
+            cv = values.real.new_full((*values.shape[:4], self.n_radial), float('nan'))
+            power = torch.abs(values)**2
+    
+            # Selects needed values. Gathers x, y dimensions into one vector.
+            # Gathering is consistent for ids and power so this doesn't matter.
+            ids = self.bin_id[self.selected]
+            power = power[..., self.selected]
+
+            # Create initial array of zeros with the correct shape to scatter add.
+            initial = power.new_zeros((*power.shape[:-1], self.n_angles * self.n_radial))
+
+            bin_sums = initial.scatter_add(dim=-1, index=ids.expand_as(power), src=power)
+            
+            bin_means = bin_sums / self.bin_counts.clamp_min(1)
+            
+            bin_means = torch.reshape(bin_means, (*bin_means.shape[:-1], self.n_radial, self.n_angles))
+
+            populated = (
+                self.bin_counts.reshape(self.n_radial, self.n_angles) > 0
+            )                                                     # [n_radial, n_angles]
+            n_populated = populated.sum(dim=-1)                   # [n_radial]
+            usable = n_populated >= 2                             # [n_radial]
+
+            # Mean over populated angular bins only.
+            radial_mean = (
+                bin_means.masked_fill(~populated, 0).sum(dim=-1)
+                / n_populated.clamp_min(1)
+            )                                                     
+
+            deviations = bin_means - radial_mean.unsqueeze(-1)
+            deviations = deviations.masked_fill(~populated, 0)
+
+            # Sample standard deviation: sqrt(sum(deviation^2) / (N - 1)).
+            # Use a vector norm instead of explicitly taking sqrt of summed squares. It has safe backward behaviour at deviation=0.
+            radial_std = (
+                torch.linalg.vector_norm(deviations, dim=-1)
+                / (n_populated - 1).clamp_min(1).sqrt()
+            )          
+            valid = usable & (radial_mean > 0)
+            cv[valid] = radial_std[valid] / radial_mean[valid]
+
+            return cv, valid
+    
+    @staticmethod
+    def _require_finite(name: str, values: torch.Tensor) -> None:
+        if not torch.isfinite(values).all():
+            raise ValueError(f"{name} contains NaN or Inf")
+        
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        squash: bool = True,
+        *,
+        scaler_indices: tuple[int, ...] | None = None,
+        without_scalers: list[str] | list[int] | None = None,
+        grid_shard_slice: slice | None = None,
+        group: ProcessGroup | None = None,
+        grid_shard_sizes: ShardSizes = None,
+        grid_dim: int | None = None,
+        squash_mode: Squash_mode = "avg",
+        ) -> torch.Tensor:
+
+        grid_dim = TensorDim.GRID if grid_dim is None else grid_dim
+        pred, target, channel_shard_sizes = self._prepare_for_spectral_transform(
+            pred,
+            target,
+            group,
+            grid_shard_slice,
+            grid_shard_sizes,
+            grid_dim,
+        )
+        is_sharded = channel_shard_sizes is not None
+        group = group if is_sharded else None
+
+        context = torch.amp.autocast(device_type=pred.device.type, enabled=False) if self.no_autocast else nullcontext()
+        with context:
+            
+            # -> [..., modes, vars]
+            # _to_spectral adds two spatial dimensions to Tensor
+            # -> [..., y, x, vars]
+            # pred_spec = self._to_spectral(pred)
+            pred = self._select_and_project(pred)
+            target = self._select_and_project(target)
+
+            self._require_finite("Selected prediction", pred)
+            self._require_finite("Selected target", target)
+            
+            if self.apply_hann_window:
+                pred = (pred - pred.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
+                target = (target - target.mean(dim=TensorDim.GRID, keepdim=True)) * self.hann_window[:, None]
+            
+            pred_spec = self.transform.forward(pred)
+            tgt_spec = self.transform.forward(target)
+
+            pred_spec = torch.fft.fftshift(pred_spec, dim=(-3, -2))
+            tgt_spec = torch.fft.fftshift(tgt_spec, dim=(-3, -2))
+
+            pred_spec = einops.rearrange(pred_spec, "b t e y x v -> b t e v y x")  # grid dim last
+            tgt_spec = einops.rearrange(tgt_spec, "b t 1 y x v -> b t 1 v y x")
+
+            # Apply angular cv -> [b, t, e, v, cv]
+            pred_cv, pred_valid = self._angular_cv(pred_spec)
+            tgt_cv, tgt_valid = self._angular_cv(tgt_spec)
+
+            valid_pair = pred_valid & tgt_valid
+
+            # Calculate and return cv loss
+            # MAE, apply weighing per bin.
+            absolute_error = (pred_cv - tgt_cv).abs()
+            absolute_error = absolute_error.masked_fill(~valid_pair, 0)
+
+            if self.bin_weights is not None:
+                weighed_absolute_error = absolute_error.mul(self.bin_weights)
+            else:
+                weighed_absolute_error = absolute_error
+
+            # Rearrange again consistent with tensordim to prepare for resharding
+            weighed_absolute_error = einops.rearrange(weighed_absolute_error, "b t e v r -> b t e r v")
+            weighed_absolute_error, spectral_shard_slice, global_spectral_size = self._reshard_spectral_loss(
+                weighed_absolute_error,
+                group,
+                channel_shard_sizes,
+                grid_dim,
+            )
+
+            nan_mask = self.scaler.tensors.get("nan_mask_weights")
+            if nan_mask is not None:
+                dims, weights = nan_mask
+                if TensorDim.GRID in dims and weights.shape[dims.index(TensorDim.GRID)] > 1:
+                    msg = (
+                        "SpectralCVLoss does not support spatial nan_mask_weights: "
+                        "the mask must have a singleton grid dimension. Spatial missing-value "
+                        "masks cannot be applied to radial bands; the selected FFT grid must be finite."
+                    )
+                    raise ValueError(msg)
+            _assert_spectral_scalers_compatible(self.scaler, global_spectral_size)
+            # Scaling allows per variable setting of importance, even though CV is already mean normalised.
+            scaled = self.scale(
+                weighed_absolute_error,
+                scaler_indices,
+                without_scalers=without_scalers,
+                grid_shard_slice=spectral_shard_slice,
+            )
+
+            # Reduce, sharding compatible
+            return self.reduce(scaled, squash=squash, group=group, squash_mode=squash_mode)
+
+    @property
+    def name(self) -> str:
+        return "Spectral-CV"
