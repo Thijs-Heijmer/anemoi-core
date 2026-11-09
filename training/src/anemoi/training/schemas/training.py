@@ -557,6 +557,7 @@ def _loss_discriminator(v: Any) -> str:
         "anemoi.training.losses.SpectralCRPSLoss",
         "anemoi.training.losses.PowerSpectrumLoss",
         "anemoi.training.losses.SpectralAMSELoss",
+        "anemoi.training.losses.SpectralCVLoss",
     }:
         return "spectral"
     if target == "anemoi.training.losses.HuberLoss":
